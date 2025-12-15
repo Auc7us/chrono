@@ -200,8 +200,9 @@ static __device__ __inline__ float3 CalculateReflectedColor(
 
                     float3 light_attenuation = prd_shadow.attenuation;
 
-                    float point_light_falloff =
-                        (l.max_range * l.max_range / (dist_to_light * dist_to_light + l.max_range * l.max_range));
+                    // Smooth attenuation: 1.0 at source, ~0.1 at dist=max_range.
+                    float t = dist_to_light / fmaxf(l.max_range, 1e-6f);
+                    float point_light_falloff = 1.0f / (1.0f + 9.0f * t * t);
 
                     float3 incoming_light_ray = l.color * light_attenuation * point_light_falloff * NdL;
 
@@ -916,6 +917,9 @@ static __device__ inline void CameraHapkeShader(PerRayData_camera* prd_camera,
             for (int i = 0; i < params.num_lights; i++) {
                 PointLight l = params.lights[i];
                 float dist_to_light = Length(l.pos - hit_point);
+                // Smooth attenuation: 1.0 at source, ~0.1 at dist=max_range.
+                float t = dist_to_light / fmaxf(l.max_range, 1e-6f);
+                float point_light_falloff = 1.0f / (1.0f + 9.0f * t * t);
                 //printf("dist_to_light:%.4f\n", dist_to_light);
                 if (1) {//dist_to_light < 2 * l.max_range{ // Sun should have infinity range, so this condition will always be true for ths sun
                     float3 dir_to_light = normalize(l.pos - hit_point);
@@ -937,7 +941,7 @@ static __device__ inline void CameraHapkeShader(PerRayData_camera* prd_camera,
                         float3 light_attenuation = prd_shadow.attenuation;
 
                         ////float point_light_falloff  = 1.0f; // ??
-                        float3 incoming_light_ray = l.color * cos_i * light_attenuation; // Add attenuation later
+                        float3 incoming_light_ray = l.color * cos_i * light_attenuation * point_light_falloff;
                         //printf("incoming_light_ray: (%.2f,%.2f,%.2f)\n", incoming_light_ray.x, incoming_light_ray.y, incoming_light_ray.z);
                         if (fmaxf(incoming_light_ray) > 0.0f) {
                             

@@ -40,6 +40,7 @@
 #include "chrono_sensor/filters/ChFilterVisualizePointCloud.h"
 #include "chrono_sensor/filters/ChFilterRadarXYZReturn.h"
 #include "chrono_sensor/filters/ChFilterRadarXYZVisualize.h"
+#include "chrono_sensor/optix/ChOptixDefinitions.h"  // PointLight
 
 #include "chrono_ros/ChROSManager.h"
 #include "chrono_ros/handlers/ChROSClockHandler.h"
@@ -460,9 +461,16 @@ int main(int argc, char* argv[]) {
 
     // Sensor Manager
     auto manager = chrono_types::make_shared<ChSensorManager>(&sys);
-    manager->scene->AddPointLight({-10, 0, 50}, {1.f, 1.f, 1.f}, 1000);
+    // Restore a gentle ambient term so the scene isn’t fully black away from the headlamp.
+    manager->scene->SetAmbientLight({0.2f, 0.2f, 0.2f});
+    // Softer global fill.
+    manager->scene->AddPointLight({-10.f, 0.f, 50.f}, {0.3f, 0.3f, 0.3f}, 200.f);
+    // Headlamp-style rover light, positioned near the stereo rig (slightly below the camera).
+    // Moderate headlamp brightness; warm tint with noticeable falloff.
+    unsigned int rover_light_id = manager->scene->AddPointLight({0.f, 0.f, 0.f}, {1.0f, 0.9f, 0.8f}, 20.f);
     manager->SetVerbose(false);
     Background b;
+    // Restore HDR environment map background.
     b.mode = BackgroundMode::ENVIRONMENT_MAP;
     b.env_tex = GetChronoDataFile("sensor/textures/starmap_2020_4k.hdr");
     manager->scene->SetBackground(b);
@@ -579,6 +587,16 @@ int main(int argc, char* argv[]) {
 
         // Advance all sensors; each camera decides internally when to render
         // based on its own update rate and the current simulation time.
+        // Keep the rover-mounted light attached to the chassis.
+        {
+            PointLight pl{};
+            const ChVector3d light_offset(1.5, 0.0, 0.25);  // near stereo cameras, slightly lower
+            ChVector3d light_pos = viper.GetChassis()->GetBody()->GetPos() + light_offset;
+            pl.pos = make_float3((float)light_pos.x(), (float)light_pos.y(), (float)light_pos.z());
+            pl.color = make_float3(2.0f, 1.9f, 1.6f);
+            pl.max_range = 10.f;
+            manager->scene->ModifyPointLight(rover_light_id, pl);
+        }
         manager->Update();
 
         // Advance the rover and dynamics.
