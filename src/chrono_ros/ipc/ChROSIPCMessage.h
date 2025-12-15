@@ -45,6 +45,9 @@ enum class MessageType : uint32_t {
     IMU_DATA = 14,
     GPS_DATA = 15,
     CUSTOM_DATA = 16,
+    VIPER_SPEED_DRIVER = 17,  ///< Bidirectional: subprocess subscriber -> main process
+    VIPER_WAYPOINT_FOLLOWER = 18,  ///< Bidirectional: subprocess subscriber -> main process
+    VIPER_WAYPOINT_PATH = 19,  ///< Publisher: main process -> subprocess ROS
     SHUTDOWN = 99
 };
 

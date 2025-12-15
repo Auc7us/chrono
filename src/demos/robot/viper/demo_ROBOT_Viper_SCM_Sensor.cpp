@@ -19,6 +19,8 @@
 
 #include "chrono_models/robot/viper/Viper.h"
 
+#include <chrono>
+
 #include "chrono/physics/ChSystemNSC.h"
 #include "chrono/physics/ChBodyEasy.h"
 #include "chrono/input_output/ChWriterCSV.h"
@@ -80,9 +82,6 @@ ViperWheelType wheel_type = ViperWheelType::RealWheel;
 
 // Use custom material for the Viper wheel
 bool use_custom_mat = false;
-
-// Run-time visualization system (IRRLICHT or VSG)
-ChVisualSystem::Type vis_type = ChVisualSystem::Type::VSG;
 
 // -----------------------------------------------------------------------------
 
@@ -166,7 +165,7 @@ int main(int argc, char* argv[]) {
     // Create a Chrono physical system and associated collision system
     ChSystemNSC sys;
     sys.SetCollisionSystemType(ChCollisionSystem::Type::BULLET);
-    sys.SetGravitationalAcceleration(ChVector3d(0, 0, -9.81));
+    sys.SetGravitationalAcceleration(ChVector3d(0, 0, -1.62));
 
     // Initialize output
     std::string out_dir = GetChronoOutputPath() + "ROBOT_Viper_SCM_SENSOR";
@@ -315,8 +314,8 @@ int main(int argc, char* argv[]) {
     terrain.SetReferenceFrame(ChCoordsys<>(ChVector3d(0, 0, terrain_height)));
 
     // Use a regular grid:
-    double length = 15;
-    double width = 15;
+    double length = 200;
+    double width = 50;
     terrain.Initialize(length, width, mesh_resolution);
 
     // Add hapke material to the terrain
@@ -446,6 +445,7 @@ int main(int argc, char* argv[]) {
     radar->PushFilter(chrono_types::make_shared<ChFilterRadarXYZVisualize>(960, 480, 0.2, "Front Radar"));
 
     // Add camera
+    // Camera mounted on the rover (original pose)
     auto cam = chrono_types::make_shared<ChCameraSensor>(viper.GetChassis()->GetBody(),  // body camera is attached to
                                                          50,                             // scanning rate in Hz
                                                          offset_pose,                    // offset pose
@@ -458,78 +458,33 @@ int main(int argc, char* argv[]) {
     cam->SetCollectionWindow(0.02f);
     cam->PushFilter(chrono_types::make_shared<ChFilterVisualize>(960, 480, "Camera Image"));
 
-    // add lidar, radar and camera to the sensor manager
+    // Overview camera: same orientation as main mount, just moved back/up
+    auto overview_rot = offset_pose.GetRot();
+    ChVector3d overview_offset_local(-6.0, 0.0, 2.0);
+    ChVector3d overview_pos = viper.GetChassis()->GetBody()->GetPos() + overview_rot.Rotate(overview_offset_local);
+    auto overview_pose = ChFrame<>(overview_pos, overview_rot);
+    auto scene_cam = chrono_types::make_shared<ChCameraSensor>(viper.GetChassis()->GetBody(),
+                                                               30,
+                                                               overview_pose,
+                                                               1280,
+                                                               720,
+                                                               CH_PI / 4);
+    scene_cam->SetName("Overview Camera");
+    scene_cam->SetLag(0.f);
+    scene_cam->SetCollectionWindow(0.03f);
+    scene_cam->PushFilter(chrono_types::make_shared<ChFilterVisualize>(1280, 720, "Overview Camera"));
+
+    // add lidar, radar and cameras to the sensor manager
     manager->AddSensor(lidar);
     manager->AddSensor(radar);
     manager->AddSensor(cam);
-
-    // RUN_TIME VISUALIZATION
-
-#ifndef CHRONO_IRRLICHT
-    if (vis_type == ChVisualSystem::Type::IRRLICHT)
-        vis_type = ChVisualSystem::Type::VSG;
-#endif
-#ifndef CHRONO_VSG
-    if (vis_type == ChVisualSystem::Type::VSG)
-        vis_type = ChVisualSystem::Type::IRRLICHT;
-#endif
-
-    std::shared_ptr<ChVisualSystem> vis;
-    switch (vis_type) {
-        case ChVisualSystem::Type::IRRLICHT: {
-#ifdef CHRONO_IRRLICHT
-            auto vis_irr = chrono_types::make_shared<ChVisualSystemIrrlicht>();
-            vis_irr->AttachSystem(&sys);
-            vis_irr->SetCameraVertical(CameraVerticalDir::Z);
-            vis_irr->SetWindowSize(800, 600);
-            vis_irr->SetWindowTitle("Viper Rover on SCM");
-            vis_irr->Initialize();
-            vis_irr->AddLogo();
-            vis_irr->AddSkyBox();
-            vis_irr->AddCamera(ChVector3d(1.0, 2.0, 1.4), ChVector3d(0, 0, wheel_diameter));
-            vis_irr->AddTypicalLights();
-            vis_irr->AddLightWithShadow(ChVector3d(-5.0, -0.5, 8.0), ChVector3d(-1, 0, 0), 100, 1, 35, 85, 512,
-                                        ChColor(0.8f, 0.8f, 0.8f));
-            vis_irr->EnableShadows();
-
-            vis = vis_irr;
-#endif
-            break;
-        }
-        default:
-        case ChVisualSystem::Type::VSG: {
-#ifdef CHRONO_VSG
-            // SCM plugin
-            auto visSCM = chrono_types::make_shared<vehicle::ChScmVisualizationVSG>(&terrain);
-
-            auto vis_vsg = chrono_types::make_shared<ChVisualSystemVSG>();
-            vis_vsg->AttachSystem(&sys);
-            vis_vsg->AttachPlugin(visSCM);
-            vis_vsg->SetWindowSize(1280, 800);
-            vis_vsg->SetWindowTitle("Viper Rover on SCM");
-            vis_vsg->SetBackgroundColor(ChColor(0, 0, 0));
-            vis_vsg->AddCamera(ChVector3d(1.0, 2.0, 1.4), ChVector3d(0, 0, wheel_diameter));
-            vis_vsg->SetLightIntensity(1.0f);
-            vis_vsg->SetLightDirection(CH_PI, 1.37);
-            vis_vsg->EnableShadows();
-            vis_vsg->Initialize();
-
-            vis = vis_vsg;
-#endif
-            break;
-        }
-    }
+    manager->AddSensor(scene_cam);
 
     // SIMULATION LOOP
 
-    while (vis->Run()) {
-#if defined(CHRONO_IRRLICHT) || defined(CHRONO_VSG)
-        vis->BeginScene();
-        vis->SetCameraTarget(Body_1->GetPos());
-        vis->Render();
-        vis->EndScene();
-#endif
-
+    const double end_time = 20.0;
+    auto wall_start = std::chrono::steady_clock::now();
+    while (sys.GetChTime() < end_time) {
         manager->Update();
 
         if (output) {
@@ -543,6 +498,11 @@ int main(int argc, char* argv[]) {
 
         viper.Update();
         ////terrain.PrintStepStatistics(std::cout);
+
+        auto wall_now = std::chrono::steady_clock::now();
+        double wall_elapsed = std::chrono::duration_cast<std::chrono::duration<double>>(wall_now - wall_start).count();
+        double rtf = (wall_elapsed > 0) ? wall_elapsed / sys.GetChTime() : 0.0;
+        std::cout << "[RTF] sim_time=" << sys.GetChTime() << " wall=" << wall_elapsed << " rtf=" << rtf << std::endl;
     }
 
     if (output) {

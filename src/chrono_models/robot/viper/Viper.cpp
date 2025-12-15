@@ -9,7 +9,7 @@
 // http://projectchrono.org/license-chrono.txt.
 //
 // =============================================================================
-// Authors: Jason Zhou, Radu Serban
+// Authors: Jason Zhou, Radu Serbanl, Keshav Sharan
 // =============================================================================
 //
 // NASA VIPER Lunar Rover Model Class.
@@ -27,7 +27,10 @@
 //
 // =============================================================================
 
+#include <algorithm>
 #include <cmath>
+#include <iostream>
+#include <limits>
 
 #include "chrono/assets/ChVisualShapeBox.h"
 #include "chrono/assets/ChVisualShapeCylinder.h"
@@ -53,7 +56,8 @@ namespace viper {
 
 // =============================================================================
 
-const double Viper::m_max_steer_angle = CH_PI / 6;
+const double Viper::m_max_steer_angle = 5 * CH_PI / 18;
+const double Viper::max_wheel_speed = CH_PI;
 
 // =============================================================================
 
@@ -389,6 +393,8 @@ void Viper::Create(ViperWheelType wheel_type) {
     double wx = 0.5618 + 0.08;
     double wy = 0.2067 + 0.32 + 0.0831;
     double wz = 0.0;
+    m_wheelbase = 2.0 * wx;  // Distance between front and rear axles
+    m_track_width = 2.0 * wy; // Distance between left and right wheels
 
     m_wheels[V_LF] = chrono_types::make_shared<ViperWheel>("wheel_LF", ChFrame<>(ChVector3d(+wx, +wy, wz), QUNIT),
                                                            m_wheel_material, wheel_type);
@@ -696,6 +702,7 @@ void ViperDriver::SetLifting(double angle) {
         lift_angles[i] = angle;
 }
 
+/// DC Motor Control
 ViperDCMotorControl::ViperDCMotorControl()
     : m_stall_torque({300, 300, 300, 300}), m_no_load_speed({CH_PI, CH_PI, CH_PI, CH_PI}) {}
 
@@ -717,6 +724,7 @@ void ViperDCMotorControl::Update(double time) {
     }
 }
 
+/// Angular Speed Driver
 ViperSpeedDriver::ViperSpeedDriver(double time_ramp, double speed) : m_ramp(time_ramp), m_speed(speed) {}
 
 void ViperSpeedDriver::Update(double time) {
@@ -726,11 +734,370 @@ void ViperSpeedDriver::Update(double time) {
     drive_speeds = {speed, speed, speed, speed};
 }
 
-void ViperDirectControl::SetDirectControl(std::array<double, 4> m_drive_speeds, std::array<double, 4> m_steer_angles, std::array<double, 4> m_lift_angles){
-    drive_speeds = m_drive_speeds;
-    steer_angles = m_steer_angles;
-    lift_angles = m_lift_angles;
+/// Waypoint Follower
+ViperWaypointFollower::ViperWaypointFollower(double init_target_x, double init_target_y, double init_target_z)
+    : m_target_x(init_target_x),
+      m_target_y(init_target_y),
+      m_target_z(init_target_z),
+      m_waypoint_threshold(0.25),
+      m_curvature_limit_rad(50.0 * CH_PI / 180.0),
+      m_lookahead_distance(1.2),
+      m_reverse_heading_threshold(CH_PI / 2.0),
+      m_nominal_speed_ratio(0.8),
+      m_goal_slowdown_radius(0.25),
+      m_reverse_speed_ratio(0.6),
+      m_min_speed_ratio(0.1),
+      m_reverse_mode(false) {}
+
+void ViperWaypointFollower::SetTarget(double x, double y, double z) {
+    m_target_x = x;
+    m_target_y = y;
+    m_target_z = z;
+    m_reverse_mode = false;
+
+    if (!viper) {
+        std::cout << "[ViperWaypointFollower] Received target (" << x << ", " << y << ", " << z
+                  << ") but rover handle not yet assigned." << std::endl;
+        return;
+    }
+
+    auto chassis_body = viper->GetChassis()->GetBody();
+    std::cout << "[ViperWaypointFollower] Final Target = (" << x << ", " << y << ", " << z << ")"
+              << " | Current Pos: " << chassis_body->GetPos()
+              << " | Current Vel: " << chassis_body->GetPosDt() << std::endl;
+
+    auto start_pos = viper->GetChassisPos();
+    auto yaw = ExtractYaw(viper->GetChassisRot());
+    BuildCurvatureLimitedSpline(start_pos, yaw, ChVector3d(m_target_x, m_target_y, start_pos.z()));
+}
+
+void ViperWaypointFollower::Update(double time) {
+    (void)time;
+
+    if (!viper)
+        return;
+
+    ChVector3d current_position = viper->GetChassisPos();
+    ChQuaternion<> q = viper->GetChassisRot();
+    double yaw = ExtractYaw(q);
+    ChVector3d final_target(m_target_x, m_target_y, current_position.z());
+    ChVector3d final_delta(final_target.x() - current_position.x(), final_target.y() - current_position.y(), 0);
+    double distance_to_target = final_delta.Length();
+
+    if (distance_to_target < m_waypoint_threshold) {
+        drive_speeds = {0.0, 0.0, 0.0, 0.0};
+        steer_angles = {0.0, 0.0, 0.0, 0.0};
+        m_path_points.clear();
+        m_path_index = 0;
+        m_reverse_mode = false;
+        m_angular_velocity = 0.0;
+        return;
+    }
+
+    if (m_path_points.empty())
+        BuildCurvatureLimitedSpline(current_position, yaw, final_target);
+
+    if (m_path_points.empty()) {
+        drive_speeds = {0.0, 0.0, 0.0, 0.0};
+        steer_angles = {0.0, 0.0, 0.0, 0.0};
+        return;
+    }
+
+    size_t closest_idx = FindClosestPathIndex(current_position);
+    m_path_index = closest_idx;
+    size_t lookahead_idx = SelectLookaheadIndex(closest_idx, m_lookahead_distance);
+    lookahead_idx = std::min(lookahead_idx, m_path_points.size() - 1);
+    ChVector3d lookahead_point = m_path_points[lookahead_idx];
+    double actual_lookahead = (lookahead_point - current_position).Length();
+    if (actual_lookahead < 1e-4)
+        actual_lookahead = m_lookahead_distance;
+
+    bool reverse_flag = false;
+    double curvature = ComputePurePursuitCurvature(lookahead_point, current_position, yaw, actual_lookahead, reverse_flag);
+    m_reverse_mode = reverse_flag;
+
+    double wheelbase = viper->GetWheelbase();
+    double track_width = viper->GetTrackWidth();
+    double steer_limit = viper->GetMaxSteerAngle();
+
+    std::array<double, 4> steering_cmd = {0.0, 0.0, 0.0, 0.0};
+    std::array<double, 4> radii = {std::numeric_limits<double>::infinity(), std::numeric_limits<double>::infinity(),
+                                   std::numeric_limits<double>::infinity(), std::numeric_limits<double>::infinity()};
+    double center_angle = 0.0;
+    double max_radius = MapCurvatureToSteering(curvature, wheelbase, track_width, steer_limit, steering_cmd, radii,
+                                               center_angle);
+
+    double base_speed = viper->GetMaxWheelSpeed() * m_nominal_speed_ratio;
+    double speed_command =
+        ComputeSpeedCommand(center_angle, steer_limit, distance_to_target, base_speed, reverse_flag);
+
+    if (!std::isfinite(max_radius) || max_radius < 1e-6) {
+        for (int i = 0; i < 4; i++) {
+            drive_speeds[i] = reverse_flag ? -speed_command : speed_command;
+            turn_radius[i] = radii[i];
+        }
+        m_angular_velocity = 0.0;
+    } else {
+        m_angular_velocity = speed_command / std::max(max_radius, 1e-6);
+        for (int i = 0; i < 4; i++) {
+            double scaled_speed = speed_command * (radii[i] / max_radius);
+            drive_speeds[i] = reverse_flag ? -scaled_speed : scaled_speed;
+            turn_radius[i] = radii[i];
+        }
+    }
+
+    for (int i = 0; i < 4; i++) {
+        steer_angles[i] = steering_cmd[i];
+    }
+
+    // Throttle verbose logging to avoid spamming stdout and stalling the main loop.
+    // Log on index change or every N iterations.
+    static size_t last_idx = std::numeric_limits<size_t>::max();
+    static int log_decim = 0;
+    if (lookahead_idx != last_idx || (log_decim++ % 50) == 0) {
+        last_idx = lookahead_idx;
+        std::cout << "[ViperWaypointFollower] Pos: " << current_position << " | Lookahead: " << lookahead_point
+                  << " | Reverse: " << (reverse_flag ? "true" : "false") << " | idx " << lookahead_idx << " / "
+                  << m_path_points.size() << std::endl;
+        std::cout << "[ViperWaypointFollower] Curvature: " << curvature
+                  << " | Center steer (deg): " << center_angle * 180.0 / CH_PI << " | Speed cmd: " << speed_command
+                  << std::endl;
+    }
+}
+
+size_t ViperWaypointFollower::FindClosestPathIndex(const ChVector3d& position) const {
+    if (m_path_points.empty())
+        return 0;
+
+    size_t closest = 0;
+    ChVector3d delta0 = m_path_points[0] - position;
+    double min_dist2 = delta0.Dot(delta0);
+
+    for (size_t i = 1; i < m_path_points.size(); ++i) {
+        ChVector3d delta = m_path_points[i] - position;
+        double dist2 = delta.Dot(delta);
+        if (dist2 < min_dist2) {
+            min_dist2 = dist2;
+            closest = i;
+        }
+    }
+
+    return closest;
+}
+
+size_t ViperWaypointFollower::SelectLookaheadIndex(size_t closest_idx, double lookahead_distance) const {
+    if (m_path_points.empty())
+        return 0;
+
+    size_t start_idx = std::min(closest_idx, m_path_points.size() - 1);
+    double accumulated = 0.0;
+    size_t idx = start_idx;
+
+    for (size_t i = start_idx; i + 1 < m_path_points.size(); ++i) {
+        ChVector3d segment = m_path_points[i + 1] - m_path_points[i];
+        accumulated += segment.Length();
+        idx = i + 1;
+        if (accumulated >= lookahead_distance)
+            break;
+    }
+
+    return idx;
+}
+
+double ViperWaypointFollower::ComputePurePursuitCurvature(const ChVector3d& lookahead_point,
+                                                          const ChVector3d& rover_pos,
+                                                          double rover_yaw,
+                                                          double lookahead_distance,
+                                                          bool& reverse_mode) const {
+    ChVector3d delta = lookahead_point - rover_pos;
+    double heading_to_target = std::atan2(delta.y(), delta.x());
+    double heading_error = heading_to_target - rover_yaw;
+    heading_error = std::atan2(std::sin(heading_error), std::cos(heading_error));
+
+    reverse_mode = std::abs(heading_error) > m_reverse_heading_threshold;
+
+    double Ld = std::max(lookahead_distance, 1e-4);
+    return 2.0 * std::sin(heading_error) / Ld;
+}
+
+double ViperWaypointFollower::MapCurvatureToSteering(double curvature,
+                                                     double wheelbase,
+                                                     double track_width,
+                                                     double steer_limit,
+                                                     std::array<double, 4>& out_angles,
+                                                     std::array<double, 4>& out_radii,
+                                                     double& center_angle) const {
+    const double steering_eps = 1e-6;
+    center_angle = std::atan(wheelbase * curvature);
+    ChClampValue(center_angle, -steer_limit, steer_limit);
+
+    if (std::abs(center_angle) < steering_eps) {
+        out_angles.fill(0.0);
+        out_radii.fill(std::numeric_limits<double>::infinity());
+        return std::numeric_limits<double>::infinity();
+    }
+
+    double icr_y = wheelbase / std::tan(center_angle);
+    double omega_sign = (center_angle >= 0.0) ? 1.0 : -1.0;
+    double half_wheelbase = 0.5 * wheelbase;
+    double half_track = 0.5 * track_width;
+    std::array<double, 4> wheel_x = {half_wheelbase, half_wheelbase, -half_wheelbase, -half_wheelbase};
+    std::array<double, 4> wheel_y = {half_track, -half_track, half_track, -half_track};
+
+    double max_radius = 0.0;
+
+    for (int i = 0; i < 4; ++i) {
+        double delta_y = wheel_y[i] - icr_y;
+        double radius = std::sqrt(wheel_x[i] * wheel_x[i] + delta_y * delta_y);
+        out_radii[i] = radius;
+        if (radius > max_radius)
+            max_radius = radius;
+
+        double v_x = -omega_sign * delta_y;
+        double v_y = omega_sign * wheel_x[i];
+        double wheel_angle = std::atan2(v_y, v_x);
+        ChClampValue(wheel_angle, -steer_limit, steer_limit);
+        out_angles[i] = wheel_angle;
+    }
+
+    return max_radius;
+}
+
+double ViperWaypointFollower::ComputeSpeedCommand(double center_angle,
+                                                  double steer_limit,
+                                                  double distance_to_goal,
+                                                  double base_speed,
+                                                  bool reverse_mode) const {
+    double steer_ratio = (steer_limit > 1e-6) ? std::abs(center_angle) / steer_limit : 0.0;
+    double speed_scale = 1.0;
+
+    if (steer_ratio <= 0.7) {
+        double normalized = steer_ratio / 0.7;
+        speed_scale *= (1.0 - 0.3 * normalized);
+    } else {
+        speed_scale *= 0.4;
+    }
+
+    double slowdown_radius = std::max(m_goal_slowdown_radius, 1e-3);
+    if (distance_to_goal < slowdown_radius) {
+        double normalized_dist = std::clamp(distance_to_goal / slowdown_radius, 0.0, 1.0);
+        double slowdown_factor = 0.1 + 0.9 * normalized_dist;
+        speed_scale *= slowdown_factor;
+    }
+
+    if (reverse_mode)
+        speed_scale *= m_reverse_speed_ratio;
+
+    speed_scale = std::clamp(speed_scale, m_min_speed_ratio, 1.0);
+    return base_speed * speed_scale;
+}
+
+void ViperWaypointFollower::BuildCurvatureLimitedSpline(const ChVector3d& start_pos,
+                                                        double start_yaw,
+                                                        const ChVector3d& goal_pos) {
+    m_path_points.clear();
+    m_path_index = 0;
+
+    ChVector3d start_dir(std::cos(start_yaw), std::sin(start_yaw), 0);
+    double start_dir_len = std::sqrt(start_dir.x() * start_dir.x() + start_dir.y() * start_dir.y());
+    if (start_dir_len < 1e-6) {
+        start_dir = ChVector3d(1, 0, 0);
+        start_dir_len = 1.0;
+    }
+    start_dir /= start_dir_len;
+
+    ChVector3d flattened_goal(goal_pos.x(), goal_pos.y(), start_pos.z());
+    ChVector3d chord = flattened_goal - start_pos;
+    double distance = chord.Length();
+    if (distance < 1e-3) {
+        m_path_points.push_back(flattened_goal);
+        return;
+    }
+
+    ChVector3d end_dir(chord.x(), chord.y(), 0);
+    double end_dir_len = std::sqrt(end_dir.x() * end_dir.x() + end_dir.y() * end_dir.y());
+    if (end_dir_len < 1e-6) {
+        end_dir = start_dir;
+        end_dir_len = 1.0;
+    }
+    end_dir /= end_dir_len;
+
+    double control_scale = std::max(0.05, std::min(distance * 0.5, distance));
+
+    std::array<ChVector3d, 4> control_pts = {
+        start_pos,
+        start_pos + start_dir * control_scale,
+        flattened_goal - end_dir * control_scale,
+        flattened_goal};
+
+    size_t base_samples =
+        static_cast<size_t>(std::max<double>(20.0, std::ceil(distance / std::max(0.1, m_waypoint_threshold * 0.5))));
+
+    m_path_points.reserve(base_samples + 1);
+    for (size_t i = 0; i <= base_samples; ++i) {
+        double t = static_cast<double>(i) / static_cast<double>(base_samples);
+        m_path_points.push_back(EvaluateBezierPoint(control_pts, t));
+    }
+
+    EnsureCurvatureLimit(m_path_points);
+}
+
+void ViperWaypointFollower::EnsureCurvatureLimit(std::vector<ChVector3d>& samples) {
+    if (samples.size() < 3)
+        return;
+
+    bool inserted = true;
+    int guard = 0;
+    const int guard_limit = 200;
+
+    while (inserted && guard < guard_limit) {
+        inserted = false;
+        for (size_t i = 1; i + 1 < samples.size(); ++i) {
+            ChVector3d prev = samples[i] - samples[i - 1];
+            ChVector3d next = samples[i + 1] - samples[i];
+
+            double prev_len = prev.Length();
+            double next_len = next.Length();
+
+            if (prev_len < 1e-6 || next_len < 1e-6)
+                continue;
+
+            ChVector3d prev_n = prev / prev_len;
+            ChVector3d next_n = next / next_len;
+
+            double dot = prev_n.Dot(next_n);
+            ChClampValue(dot, -1.0, 1.0);
+            double heading_change = std::acos(dot);
+            if (heading_change > m_curvature_limit_rad) {
+                ChVector3d mid = 0.5 * (samples[i] + samples[i + 1]);
+                samples.insert(samples.begin() + i + 1, mid);
+                inserted = true;
+                break;
+            }
+        }
+        ++guard;
+    }
+}
+
+ChVector3d ViperWaypointFollower::EvaluateBezierPoint(const std::array<ChVector3d, 4>& control_pts, double t) const {
+    double u = 1.0 - t;
+    double b0 = u * u * u;
+    double b1 = 3 * u * u * t;
+    double b2 = 3 * u * t * t;
+    double b3 = t * t * t;
+
+    return control_pts[0] * b0 + control_pts[1] * b1 + control_pts[2] * b2 + control_pts[3] * b3;
+}
+
+double ViperWaypointFollower::ExtractYaw(const ChQuaternion<>& q) const {
+    return std::atan2(2.0 * (q.e0() * q.e3() + q.e1() * q.e2()),
+                      1.0 - 2.0 * (q.e2() * q.e2() + q.e3() * q.e3()));
+}
+
+std::vector<ChVector3d> ViperWaypointFollower::GetPathPoints() const {
+    return m_path_points;
 }
 
 }  // namespace viper
 }  // namespace chrono
+

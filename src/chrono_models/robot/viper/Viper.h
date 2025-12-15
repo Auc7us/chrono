@@ -9,7 +9,7 @@
 // http://projectchrono.org/license-chrono.txt.
 //
 // =============================================================================
-// Authors: Jason Zhou, Radu Serban
+// Authors: Jason Zhou, Radu Serban, Keshav Sharan
 // =============================================================================
 //
 // NASA VIPER Lunar Rover Model Class.
@@ -23,7 +23,9 @@
 
 #include <string>
 #include <array>
-
+#include <vector>
+// #include <execinfo.h>
+// #include <cstdlib>
 #include "chrono/assets/ChColor.h"
 #include "chrono/physics/ChLinkMotorRotation.h"
 #include "chrono/physics/ChSystem.h"
@@ -304,6 +306,18 @@ class CH_MODELS_API Viper {
     /// Get steer motor.
     std::shared_ptr<ChLinkMotorRotation> GetSteerMotor(ViperWheelID id) const { return m_steer_motors[id]; }
 
+    /// Get max steer angles.
+    double GetMaxSteerAngle() const { return m_max_steer_angle; }
+
+    double GetMaxWheelSpeed() const { return max_wheel_speed; }
+
+    /// Get wheelbase.
+    double GetWheelbase() const { return m_wheelbase; }
+    
+    /// Get track width.
+    double GetTrackWidth() const { return m_track_width; }
+
+
     /// Viper update function.
     /// This function must be called before each integration step.
     void Update();
@@ -340,6 +354,10 @@ class CH_MODELS_API Viper {
     std::shared_ptr<ChContactMaterial> m_wheel_material;    ///< wheel contact material (shared across limbs)
 
     static const double m_max_steer_angle;  ///< maximum steering angle
+    static const double max_wheel_speed;    ///< maximum wheel speed
+
+    double m_wheelbase;
+    double m_track_width;    
 
     friend class ViperDCMotorControl;
 };
@@ -412,12 +430,14 @@ class CH_MODELS_API ViperDCMotorControl : public ViperDriver {
     std::array<double, 4> m_no_load_speed;  ///< no load speed of the motors
 };
 
-/// Concrete Viper speed driver.
+/// Concrete Viper angular speed driver.
 /// This driver applies the same angular speed (ramped from 0 to a prescribed value) to all wheels.
 class CH_MODELS_API ViperSpeedDriver : public ViperDriver {
   public:
     ViperSpeedDriver(double time_ramp, double speed);
     ~ViperSpeedDriver() {}
+
+    void SetSpeed(double speed) { m_speed = speed; }
 
   private:
     virtual DriveMotorType GetDriveMotorType() const override { return DriveMotorType::SPEED; }
@@ -427,23 +447,63 @@ class CH_MODELS_API ViperSpeedDriver : public ViperDriver {
     double m_speed;
 };
 
-/// Viper Direct Control Driver.
-/// This driver allows direct control of the drive speeds, steer angles, and lift angles for all wheels individually.
-class CH_MODELS_API ViperDirectControl : public ViperDriver {
+
+
+/// Waypoint Follower
+class CH_MODELS_API ViperWaypointFollower : public ViperDriver {
   public:
-    ViperDirectControl() {}
+    ViperWaypointFollower(double init_target_x, double init_target_y, double init_target_z); 
+    ~ViperWaypointFollower() {}
 
-    ~ViperDirectControl() {}
+    void SetTarget(double x, double y, double z);
+    std::vector<ChVector3d> GetPathPoints() const;
+    size_t GetCurrentPathIndex() const { return m_path_index; }
 
-    /// Set Direct control of drive speeds, steer angles, and lift angles
-    void SetDirectControl(
-      std::array<double, 4> m_drive_speeds, 
-      std::array<double, 4> m_steer_angles,
-      std::array<double, 4> m_lift_angles
-    );
   private:
     virtual DriveMotorType GetDriveMotorType() const override { return DriveMotorType::SPEED; }
-    virtual void Update(double time) override {}
+    virtual void Update(double time) override;
+
+    void BuildCurvatureLimitedSpline(const ChVector3d& start_pos,
+                                     double start_yaw,
+                                     const ChVector3d& goal_pos);
+    void EnsureCurvatureLimit(std::vector<ChVector3d>& samples);
+    ChVector3d EvaluateBezierPoint(const std::array<ChVector3d, 4>& control_pts, double t) const;
+    double ExtractYaw(const ChQuaternion<>& q) const;
+    size_t FindClosestPathIndex(const ChVector3d& position) const;
+    size_t SelectLookaheadIndex(size_t closest_idx, double lookahead_distance) const;
+    double ComputePurePursuitCurvature(const ChVector3d& lookahead_point,
+                                       const ChVector3d& rover_pos,
+                                       double rover_yaw,
+                                       double lookahead_distance,
+                                       bool& reverse_mode) const;
+    double MapCurvatureToSteering(double curvature,
+                                  double wheelbase,
+                                  double track_width,
+                                  double steer_limit,
+                                  std::array<double, 4>& out_angles,
+                                  std::array<double, 4>& out_radii,
+                                  double& center_angle) const;
+    double ComputeSpeedCommand(double center_angle,
+                               double steer_limit,
+                               double distance_to_goal,
+                               double base_speed,
+                               bool reverse_mode) const;
+    double m_target_x;  
+    double m_target_y;  
+    double m_target_z;
+    double m_angular_velocity = 0.0;
+    std::array<double, 4> turn_radius;
+    std::vector<ChVector3d> m_path_points;
+    size_t m_path_index = 0;
+    double m_waypoint_threshold;
+    double m_curvature_limit_rad;
+    double m_lookahead_distance;
+    double m_reverse_heading_threshold;
+    double m_nominal_speed_ratio;
+    double m_goal_slowdown_radius;
+    double m_reverse_speed_ratio;
+    double m_min_speed_ratio;
+    bool m_reverse_mode;
 };
 
 /// @} robot_models_viper
@@ -452,3 +512,4 @@ class CH_MODELS_API ViperDirectControl : public ViperDriver {
 }  // namespace chrono
 
 #endif
+
