@@ -20,7 +20,10 @@
 
 #include <cmath>
 #include <cstdint>
+#include <array>
 #include <fstream>
+#include <chrono>
+#include <limits>
 #include <stdexcept>
 
 #include "chrono/physics/ChSystemNSC.h"
@@ -275,20 +278,35 @@ int main(int argc, char* argv[]) {
     rock_vis_mat->SetUseHapke(true);
     rock_vis_mat->SetHapkeParameters(0.32357f, 0.23955f, 0.30452f, 1.80238f, 0.07145f, 0.3f,23.4f*(CH_PI/180));
 
-    // Rocks' Predefined Positions (XY fixed; Z sampled from terrain)
+    // Rocks' Predefined Positions (XY fixed; Z sampled from terrain), spread along the 200x50 terrain
+    // Reduced to ~25 rocks, clustered in small groups of 1-3 while remaining scattered across the domain.
     std::vector<ChVector3d> rock_positions = {
-        { 1.0, -0.5, 0.0}, {-0.5, -0.5, 0.0}, {2.4,  0.4, 0.0}, { 0.6,  1.0, 0.0}, { 5.5, 1.2, 0.0},
-        { 1.2,  2.1, 0.0}, {-0.3, -2.1, 0.0}, {0.4,  2.5, 0.0}, { 4.2,  1.4, 0.0}, { 5.0, 2.4, 0.0},
-        { 0.6, -1.2, 0.0}, { 4.8, -1.2, 0.0}, {2.5,  2.2, 0.0}, { 4.7, -2.2, 0.0}, {-1.7, 1.5, 0.0},
-        {-2.0, -1.1, 0.0}, {-5.0, -2.1, 0.0}, {1.5, -0.8, 0.0}, {-2.6,  1.6, 0.0}, {-2.0, 1.8, 0.0}
+        {12.0,  -6.0, 0.0}, { 5.5,  -5.0, 0.0}, { 2.5,   0.0, 0.0},
+        { 8.0,   8.0, 0.0}, {10.0,   9.5, 0.0}, {12.0,   5.5, 0.0}, 
+        {20.0,  -5.0, 0.0}, {22.5,  -4.5, 0.0},                  
+        {30.0,   9.0, 0.0}, {32.0,   7.0, 0.0}, {33.5,   8.5, 0.0},
+        {40.0,  -8.5, 0.0}, {42.0,  -5.5, 0.0},                  
+        {50.0,   5.0, 0.0}, {52.5,   6.0, 0.0}, {54.0,   5.5, 0.0}, 
+        {60.0,  -5.0, 0.0}, {62.0,  -4.5, 0.0},                   
+        {70.0,   9.5, 0.0}, {72.0,   8.0, 0.0}, {74.0,  10.5, 0.0},
+        {82.0,  -9.0, 0.0}, {84.0,  -5.0, 0.0},                    
+        {92.0,   5.0, 0.0}, {94.0,   8.5, 0.0}                     
     };
 
+    // Fixed, repeatable rock scales (base factors; multiplied below). Values chosen so final scales (with *2.5) match prior sizes.
+    std::array<double, 25> rock_scales = {
+        0.20, 0.30, 0.25, 0.26, 0.65,
+        0.40, 0.70, 0.18, 0.30, 0.50,
+        0.65, 0.26, 0.40, 0.50, 0.20,
+        0.30, 0.50, 0.18, 0.26, 0.65,
+        0.40, 0.20, 0.30, 0.50, 0.70};
+
     // Place rocks at their predefined positions (no terrain height adjustment)
-    for (int i = 0; i < 20; i++) {
+    for (int i = 0; i < static_cast<int>(rock_positions.size()); i++) {
         std::string rock_obj_path = GetChronoDataFile("robot/curiosity/rocks/rock" + std::to_string(i % 3 + 1) + ".obj");
 
         auto rock_mesh = ChTriangleMeshConnected::CreateFromWavefrontFile(rock_obj_path, false, true);
-        double scale_ratio = 0.15;
+        double scale_ratio = rock_scales[i] * 2.5;
         rock_mesh->Transform(ChVector3d(0, 0, 0), ChMatrix33<>(scale_ratio));
         rock_mesh->RepairDuplicateVertexes(1e-9);
 
@@ -312,7 +330,7 @@ int main(int argc, char* argv[]) {
         rock_body->SetInertiaXX(mdensity * principal_I);
 
         // Drop rocks from a higher initial lift so they fall visibly once (computed once at startup).
-        const double rock_lift = 0.25;  // 25 cm above local terrain
+        const double rock_lift = 0.5;  // 25 cm above local terrain
         const double rock_surface_z = terrain.GetHeight(rock_positions[i]) + rock_lift;
         ChVector3d rock_pos(rock_positions[i].x(), rock_positions[i].y(), rock_surface_z);
         rock_body->SetFrameRefToAbs(ChFrame<>(rock_pos, ChQuaternion<>(rock_rot)));
@@ -397,7 +415,7 @@ int main(int argc, char* argv[]) {
         terrain.AddActiveDomain(Wheel_3, ChVector3d(0, 0, 0), ChVector3d(0.5, 2 * wheel_range, 2 * wheel_range));
         terrain.AddActiveDomain(Wheel_4, ChVector3d(0, 0, 0), ChVector3d(0.5, 2 * wheel_range, 2 * wheel_range));
 
-        for (int i = 0; i < 20; i++) {
+        for (int i = 0; i < static_cast<int>(rock_positions.size()); i++) {
             terrain.AddActiveDomain(rocks[i], ChVector3d(0, 0, 0), ChVector3d(0.5, 0.5, 0.5));
         }
     }
@@ -462,12 +480,14 @@ int main(int argc, char* argv[]) {
     // Sensor Manager
     auto manager = chrono_types::make_shared<ChSensorManager>(&sys);
     // Restore a gentle ambient term so the scene isn’t fully black away from the headlamp.
-    manager->scene->SetAmbientLight({0.2f, 0.2f, 0.2f});
+    manager->scene->SetAmbientLight({0.0f, 0.0f, 0.0f});
     // Softer global fill.
-    manager->scene->AddPointLight({-10.f, 0.f, 50.f}, {0.3f, 0.3f, 0.3f}, 200.f);
+    manager->scene->AddPointLight({-10.f, 0.f, 50.f}, {1.f, 1.f, 1.f}, 200.f);
     // Headlamp-style rover light, positioned near the stereo rig (slightly below the camera).
     // Moderate headlamp brightness; warm tint with noticeable falloff.
-    unsigned int rover_light_id = manager->scene->AddPointLight({0.f, 0.f, 0.f}, {1.0f, 0.9f, 0.8f}, 20.f);
+    const float headlamp_range = 20.f;
+    const auto headlamp_color = make_float3(2.0f, 1.8f, 1.6f);
+    unsigned int rover_light_id = manager->scene->AddPointLight({0.f, 0.f, 0.f}, {headlamp_color.x, headlamp_color.y, headlamp_color.z}, headlamp_range);
     manager->SetVerbose(false);
     Background b;
     // Restore HDR environment map background.
@@ -481,7 +501,7 @@ int main(int argc, char* argv[]) {
     auto offset_pose_stereo_R = ChFrame<>(ChVector3d(1.5, -0.2, 0.4), QuatFromAngleZ(0));
 
     // Camera Sensor
-    int camera_update_rate = 50;
+    int camera_update_rate = 25;
     int camera_image_width = 960;
     int camera_image_height = 480;
     float camera_fov = (float)CH_PI / 3;
@@ -502,8 +522,7 @@ int main(int argc, char* argv[]) {
     stereo_L->SetName("Camera Sensor L");
     stereo_L->SetLag(0.f);
     stereo_L->SetCollectionWindow(0.02f);                                                        
-    // Visualization only unless ROS is enabled
-    stereo_L->PushFilter(chrono_types::make_shared<ChFilterVisualize>(camera_image_width, camera_image_height, "Stereo View L"));
+    // No visualization for stereo; ROS only.
     if (enable_ros) {
         stereo_L->PushFilter(chrono_types::make_shared<ChFilterRGBA8Access>());
         auto stereo_L_handler = chrono_types::make_shared<ChROSCameraHandler>(
@@ -525,8 +544,7 @@ int main(int argc, char* argv[]) {
     stereo_R->SetName("Camera Sensor");
     stereo_R->SetLag(0.f);
     stereo_R->SetCollectionWindow(0.02f);                                                        
-    // Visualization only unless ROS is enabled
-    stereo_R->PushFilter(chrono_types::make_shared<ChFilterVisualize>(camera_image_width, camera_image_height, "Stereo View R"));
+    // No visualization for stereo; ROS only.
     if (enable_ros) {
         stereo_R->PushFilter(chrono_types::make_shared<ChFilterRGBA8Access>());
         auto stereo_R_handler = chrono_types::make_shared<ChROSCameraHandler>(
@@ -567,7 +585,11 @@ int main(int argc, char* argv[]) {
     }
 
     // Run the simulation headless; keep a finite horizon to avoid infinite loops.
-    const double sim_end_time = 60.0;  // seconds
+    const double sim_end_time = 900.0;  // seconds
+    auto wall_start = std::chrono::steady_clock::now();
+    double last_rtf_print_wall = 0.0;
+    double last_rtf_print_sim = 0.0;
+    const double rtf_print_interval_wall = 1.0;  // seconds (wall)
     while (sys.GetChTime() < sim_end_time) {
         if (vis) {
 #if defined(CHRONO_IRRLICHT) || defined(CHRONO_VSG)
@@ -587,14 +609,14 @@ int main(int argc, char* argv[]) {
 
         // Advance all sensors; each camera decides internally when to render
         // based on its own update rate and the current simulation time.
-        // Keep the rover-mounted light attached to the chassis.
+        // Keep the rover-mounted light attached to the chassis (position only).
         {
             PointLight pl{};
             const ChVector3d light_offset(1.5, 0.0, 0.25);  // near stereo cameras, slightly lower
             ChVector3d light_pos = viper.GetChassis()->GetBody()->GetPos() + light_offset;
             pl.pos = make_float3((float)light_pos.x(), (float)light_pos.y(), (float)light_pos.z());
-            pl.color = make_float3(2.0f, 1.9f, 1.6f);
-            pl.max_range = 10.f;
+            pl.color = headlamp_color;
+            pl.max_range = headlamp_range;
             manager->scene->ModifyPointLight(rover_light_id, pl);
         }
         manager->Update();
@@ -602,6 +624,24 @@ int main(int argc, char* argv[]) {
         // Advance the rover and dynamics.
         viper.Update();
         sys.DoStepDynamics(time_step);
+
+        // Report real-time factor (RTF) as a slowdown multiplier: wall/sim (so 2.0 means 2x slower than real-time).
+        auto now = std::chrono::steady_clock::now();
+        double wall_elapsed = std::chrono::duration<double>(now - wall_start).count();
+        if (wall_elapsed - last_rtf_print_wall >= rtf_print_interval_wall) {
+            double sim_t = sys.GetChTime();
+            double dt_wall = wall_elapsed - last_rtf_print_wall;
+            double dt_sim = sim_t - last_rtf_print_sim;
+            double inst_rtf = dt_wall > 0.0 ? dt_sim / dt_wall : 0.0;
+            double inst_slowdown = inst_rtf > 0.0 ? 1.0 / inst_rtf : std::numeric_limits<double>::infinity();
+            double avg_rtf = wall_elapsed > 0.0 ? sim_t / wall_elapsed : 0.0;
+            double avg_slowdown = avg_rtf > 0.0 ? 1.0 / avg_rtf : std::numeric_limits<double>::infinity();
+            std::cout << "[RTF] sim=" << sim_t << "s wall=" << wall_elapsed
+                      << "s inst_rtf=" << inst_rtf << " inst_slowdown=" << inst_slowdown
+                      << "x avg_slowdown=" << avg_slowdown << "x" << std::endl;
+            last_rtf_print_wall = wall_elapsed;
+            last_rtf_print_sim = sim_t;
+        }
     }
 
     return 0;
