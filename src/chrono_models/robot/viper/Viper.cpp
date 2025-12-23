@@ -739,9 +739,9 @@ ViperWaypointFollower::ViperWaypointFollower(double init_target_x, double init_t
     : m_target_x(init_target_x),
       m_target_y(init_target_y),
       m_target_z(init_target_z),
-      m_waypoint_threshold(0.25),
-      m_curvature_limit_rad(50.0 * CH_PI / 180.0),
-      m_lookahead_distance(1.2),
+      m_waypoint_threshold(0.5),
+      m_curvature_limit_rad(60.0 * CH_PI / 180.0),
+      m_lookahead_distance(0.5),
       m_reverse_heading_threshold(CH_PI / 2.0),
       m_nominal_speed_ratio(0.8),
       m_goal_slowdown_radius(0.25),
@@ -1022,7 +1022,7 @@ void ViperWaypointFollower::BuildCurvatureLimitedSpline(const ChVector3d& start_
     }
     end_dir /= end_dir_len;
 
-    double control_scale = std::max(0.05, std::min(distance * 0.5, distance));
+    double control_scale = std::max(0.05, std::min(distance * 0.25, distance));
 
     std::array<ChVector3d, 4> control_pts = {
         start_pos,

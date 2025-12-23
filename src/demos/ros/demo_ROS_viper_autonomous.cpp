@@ -77,7 +77,7 @@ using namespace irr;
 
 // Disable visualization for headless execution.
 ChVisualSystem::Type vis_type = ChVisualSystem::Type::NONE;
-double mesh_resolution = 0.02;
+double mesh_resolution = 0.05;
 bool enable_bulldozing = false; // Enable/disable bulldozing effects
 bool enable_moving_patch = true; // Enable/disable moving patch feature
 bool var_params = true; // If true, use provided callback to change soil properties based on location
@@ -281,8 +281,8 @@ int main(int argc, char* argv[]) {
     // Rocks' Predefined Positions (XY fixed; Z sampled from terrain), spread along the 200x50 terrain
     // Reduced to ~25 rocks, clustered in small groups of 1-3 while remaining scattered across the domain.
     std::vector<ChVector3d> rock_positions = {
-        {12.0,  -6.0, 0.0}, { 5.5,  -5.0, 0.0}, { 2.5,   0.0, 0.0},
-        { 8.0,   8.0, 0.0}, {10.0,   9.5, 0.0}, {12.0,   5.5, 0.0}, 
+        {12.0,  -3.0, 0.0}, { 5.5,  -5.0, 0.0}, { 2.5,   0.0, 0.0},
+        { 8.0,   12.0, 0.0}, {10.0,   11.0, 0.0}, {11.0,   8.5, 0.0}, 
         {20.0,  -5.0, 0.0}, {22.5,  -4.5, 0.0},                  
         {30.0,   9.0, 0.0}, {32.0,   7.0, 0.0}, {33.5,   8.5, 0.0},
         {40.0,  -8.5, 0.0}, {42.0,  -5.5, 0.0},                  
