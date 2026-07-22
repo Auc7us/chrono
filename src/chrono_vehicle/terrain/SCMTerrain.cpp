@@ -34,6 +34,8 @@
 #include "chrono/assets/ChVisualShapeBox.h"
 #include "chrono/utils/ChConvexHull.h"
 #include "chrono/utils/ChUtils.h"
+#include "chrono/collision/ChCollisionShapeTriangleMesh.h"
+#include "chrono/geometry/ChTriangleMeshConnected.h"
 
 #include "chrono_vehicle/ChVehicleDataPath.h"
 #include "chrono_vehicle/terrain/SCMTerrain.h"
@@ -166,6 +168,10 @@ void SCMTerrain::SetScmGpuConfig(const scm_gpu::Config& config) {
 scm_gpu::Config SCMTerrain::GetScmGpuConfig() const {
     return m_loader->m_scm_gpu_config;
 }
+
+void SCMTerrain::EnableRaycastGpuHip(bool val) {
+    m_loader->m_raycast_gpu_hip_enabled = val;
+}
 #endif
 
 // Set properties of the SCM soil model.
@@ -191,6 +197,11 @@ void SCMTerrain::SetSoilParameters(double Bekker_Kphi,    // Kphi, frictional mo
 // Enable/disable bulldozing effect.
 void SCMTerrain::EnableBulldozing(bool val) {
     m_loader->m_bulldozing = val;
+}
+
+// Enable/disable the GPU ray-cast reference backend (see SCM_RAYCAST_GPU_PLAN.md).
+void SCMTerrain::EnableRaycastGpuReference(bool val) {
+    m_loader->m_raycast_gpu_ref_enabled = val;
 }
 
 // Set parameters controlling the creation of side ruts (bulldozing effects).
@@ -460,6 +471,8 @@ SCMLoader::SCMLoader(ChSystem* system, bool visualization_mesh) : m_soil_fun(nul
 
     m_test_offset_up = 0.1;
     m_test_offset_down = 0.5;
+
+    m_raycast_gpu_ref_enabled = false;
 
     m_boundary = false;
     m_user_domains = false;
@@ -1087,6 +1100,200 @@ bool SCMLoader::RayOBBtest(const ActiveDomainInfo& p, const ChVector3d& from, co
     return true;
 }
 
+// -----------------------------------------------------------------------------
+// GPU ray-cast reference backend (CPU stand-in; see SCM_RAYCAST_GPU_PLAN.md).
+//
+// Replaces the ray-cast loop with an orthographic depth-map style query: for each active-domain grid
+// node, find the lowest triangle surface (of any ChBody-derived contactable with a triangle-mesh
+// collision shape near the active region) above the ray's `from` point, within the SCM ray window --
+// the same "closest hit to `from`" semantics Bullet's ClosestRayResultCallback uses (SCMTerrain rays
+// run from below the nominal grid height to just above it, so "closest to from" = lowest qualifying
+// surface). Validated against Bullet RayHit() on a real Viper wheel mesh (demo_ROBOT_Viper_RaycastGpuValidate):
+// mesh + transform extraction reproduce Bullet's own collision AABB exactly up to its known
+// envelope + swept-sphere margin; zero false-positive hits. The margin correction direction below was
+// determined empirically against the production per-wheel force comparison
+// (demo_ROBOT_Viper_RaycastGpuIntegrationCheck) rather than derived from Bullet's internal formula --
+// the naive reading of ChCollisionSystemBullet::RayHit's `abs_hitPoint -= abs_hitNormal * envelope` gave
+// the wrong sign here, likely due to a mesh-winding/normal-convention difference not yet root-caused.
+//
+// This is deliberately a CPU stand-in for a future HIP kernel with the same input/output contract --
+// not yet ported to GPU, not optimized (brute-force triangle scan), and scoped to explicit per-body
+// active domains (m_user_domains) only.
+// -----------------------------------------------------------------------------
+
+namespace {
+
+struct RaycastWorldTriangle {
+    ChVector3d v0, v1, v2;
+    ChContactable* contactable;
+    double margin;  // envelope + swept-sphere radius: how far out Bullet's actual collidable surface
+                    // sits from this raw triangle (see ChCollisionSystemBullet::RayHit's own
+                    // `abs_hitPoint -= abs_hitNormal * envelope` correction, which this mirrors)
+};
+
+// Mesh + per-step transform extraction: ChCollisionModel::GetShapeInstances() for the triangle-mesh
+// shape(s), ChBody::GetFrameRefToAbs() for the world transform (GetCollisionModelFrame() is what this
+// forwards to, but is re-declared private on ChBody -- only reachable through the ChContactable base).
+void ExtractRaycastWorldTriangles(ChBody* body, std::vector<RaycastWorldTriangle>& out) {
+    auto model = body->GetCollisionModel();
+    if (!model)
+        return;
+
+    ChFrame<> model_frame = body->GetFrameRefToAbs();
+    double envelope = model->GetEnvelope();
+
+    for (const auto& inst : model->GetShapeInstances()) {
+        if (inst.shape->GetType() != ChCollisionShape::TRIANGLEMESH)
+            continue;
+
+        auto mesh_shape = std::static_pointer_cast<ChCollisionShapeTriangleMesh>(inst.shape);
+        auto trimesh = std::dynamic_pointer_cast<ChTriangleMeshConnected>(mesh_shape->GetMesh());
+        if (!trimesh)
+            continue;
+
+        double margin = envelope + mesh_shape->GetRadius();
+
+        const auto& verts = trimesh->GetCoordsVertices();
+        const auto& faces = trimesh->GetIndicesVertices();
+        ChFrame<> shape_frame = inst.frame;
+
+        for (const auto& f : faces) {
+            RaycastWorldTriangle wt;
+            wt.v0 = model_frame.TransformPointLocalToParent(shape_frame.TransformPointLocalToParent(verts[f.x()]));
+            wt.v1 = model_frame.TransformPointLocalToParent(shape_frame.TransformPointLocalToParent(verts[f.y()]));
+            wt.v2 = model_frame.TransformPointLocalToParent(shape_frame.TransformPointLocalToParent(verts[f.z()]));
+            wt.contactable = body;
+            wt.margin = margin;
+            out.push_back(wt);
+        }
+    }
+}
+
+// Segment-vs-triangle intersection (Moller-Trumbore, clamped to t in [0,1] along the segment).
+// Also returns the triangle normal, oriented outward (back toward the ray's `from` side) by
+// convention, used by the caller to apply the margin correction (see empirical sign note above).
+bool RaycastSegmentTriangleIntersect(const ChVector3d& from,
+                                     const ChVector3d& to,
+                                     const RaycastWorldTriangle& tri,
+                                     double& t_out,
+                                     ChVector3d& point_out,
+                                     ChVector3d& normal_out) {
+    const double eps = 1e-12;
+    ChVector3d dir = to - from;
+    ChVector3d edge1 = tri.v1 - tri.v0;
+    ChVector3d edge2 = tri.v2 - tri.v0;
+    ChVector3d h = Vcross(dir, edge2);
+    double a = Vdot(edge1, h);
+    if (std::abs(a) < eps)
+        return false;
+    double f = 1.0 / a;
+    ChVector3d s = from - tri.v0;
+    double u = f * Vdot(s, h);
+    if (u < 0.0 || u > 1.0)
+        return false;
+    ChVector3d q = Vcross(s, edge1);
+    double v = f * Vdot(dir, q);
+    if (v < 0.0 || u + v > 1.0)
+        return false;
+    double t = f * Vdot(edge2, q);
+    if (t < 0.0 || t > 1.0)
+        return false;
+    t_out = t;
+    point_out = from + dir * t;
+
+    // Orient the normal outward: back toward the ray's origin side (from), i.e. opposing the ray
+    // direction, matching Bullet's abs_hitNormal convention for a front-facing hit.
+    ChVector3d n = Vcross(edge1, edge2).GetNormalized();
+    normal_out = (Vdot(n, dir) > 0.0) ? -n : n;
+    return true;
+}
+
+}  // namespace
+
+// Candidate discovery: bodies whose collision AABB overlaps the union of active-domain regions --
+// mirrors what Bullet's own global RayHit() query would find, rather than assuming only the
+// explicitly-tracked ad.m_body wheels are hittable (see SCM_RAYCAST_GPU_PLAN.md). Shared by both the
+// CPU reference and HIP ray-cast backends (SCMTerrainRaycastGpu.cpp).
+void SCMLoader::DiscoverRaycastCandidates(std::vector<ChBody*>& candidates) {
+    ChAABB region;
+    bool region_valid = false;
+    for (auto& p : m_active_domains) {
+        if (!p.m_body)
+            continue;
+        ChVector3d c = p.m_body->GetFrameRefToAbs().TransformPointLocalToParent(p.m_center);
+        double r = p.m_hdims.Length();  // conservative spherical margin: safe over-approximation under rotation
+        ChAABB box(c - ChVector3d(r, r, r), c + ChVector3d(r, r, r));
+        region = region_valid ? (region + box) : box;
+        region_valid = true;
+    }
+    if (!region_valid)
+        return;  // no valid tracked-body domains; nothing to do
+
+    for (const auto& body : GetSystem()->GetBodies()) {
+        auto model = body->GetCollisionModel();
+        if (!model || model->GetNumShapes() == 0)
+            continue;
+        ChAABB box = model->GetBoundingBox(false);
+        bool overlap = box.min.x() <= region.max.x() && box.max.x() >= region.min.x() &&
+                       box.min.y() <= region.max.y() && box.max.y() >= region.min.y() &&
+                       box.min.z() <= region.max.z() && box.max.z() >= region.min.z();
+        if (overlap)
+            candidates.push_back(body.get());
+    }
+}
+
+void SCMLoader::ComputeRayCastGpuReference(std::vector<RaycastHit>& out_hits, int& num_ray_casts) {
+    num_ray_casts = 0;
+
+    std::vector<ChBody*> candidates;
+    DiscoverRaycastCandidates(candidates);
+    if (candidates.empty())
+        return;
+
+    std::vector<RaycastWorldTriangle> tris;
+    for (auto* b : candidates)
+        ExtractRaycastWorldTriangles(b, tris);
+
+    for (auto& p : m_active_domains) {
+        for (const auto& ij : p.m_range) {
+            double x = ij.x() * m_delta;
+            double y = ij.y() * m_delta;
+            double z = GetHeight(ij);
+            ChVector3d vertex_abs = m_frame.TransformPointLocalToParent(ChVector3d(x, y, z));
+            ChVector3d to = vertex_abs + m_Z * m_test_offset_up;
+            ChVector3d from = to - m_Z * m_test_offset_down;
+
+            if (m_user_domains && !RayOBBtest(p, from, m_Z))
+                continue;
+
+            ++num_ray_casts;
+
+            double best_t = std::numeric_limits<double>::infinity();
+            ChContactable* best_contactable = nullptr;
+            ChVector3d best_point;
+            double best_margin = 0;
+            ChVector3d best_normal;
+            for (const auto& tri : tris) {
+                double t;
+                ChVector3d pt, n;
+                if (RaycastSegmentTriangleIntersect(from, to, tri, t, pt, n) && t < best_t) {
+                    best_t = t;
+                    best_contactable = tri.contactable;
+                    best_point = pt;
+                    best_margin = tri.margin;
+                    best_normal = n;
+                }
+            }
+            if (best_contactable) {
+                // Empirically-determined sign (see SCM_RAYCAST_GPU_PLAN.md discussion): moves the raw
+                // intersection toward shallower sinkage, matching Bullet's actual reported hit_level.
+                best_point += best_normal * best_margin;
+                out_hits.push_back({ij, best_contactable, best_point});
+            }
+        }
+    }
+}
+
 // Offsets for the 8 neighbors of a grid vertex
 static const std::vector<ChVector2i> neighbors8{
     ChVector2i(-1, -1),  // SW
@@ -1195,6 +1402,45 @@ void SCMLoader::ComputeInternalForces() {
     m_num_ray_hits = 0;
 
     m_timer_ray_casting.start();
+
+    // Shared by both GPU ray-cast backends: fold their raw {ij, contactable, abs_point} hits into the
+    // same m_grid_map/hits structures the CPU/Bullet loop below produces, so nothing downstream
+    // (contact-patch clustering, force computation) needs to know which backend ran.
+    auto absorb_raycast_hits = [&](const std::vector<RaycastHit>& raw_hits) {
+        for (auto& rh : raw_hits) {
+            if (m_grid_map.find(rh.ij) == m_grid_map.end()) {
+                double z = GetInitHeight(rh.ij);
+                m_grid_map.insert(std::make_pair(rh.ij, NodeRecord(z, z, GetInitNormal(rh.ij))));
+            }
+            HitRecord record = {rh.contactable, rh.abs_point, -1};
+            hits.insert(std::make_pair(rh.ij, record));
+        }
+        m_num_ray_hits = (int)hits.size();
+    };
+
+#ifdef CHRONO_HAS_SCM_GPU
+    bool use_raycast_hip = m_raycast_gpu_hip_enabled && m_user_domains;
+#else
+    bool use_raycast_hip = false;
+#endif
+
+    if (use_raycast_hip) {
+        // GPU ray-cast HIP backend (see SCM_RAYCAST_GPU_PLAN.md).
+        std::vector<RaycastHit> raw_hits;
+        int rc_num_ray_casts = 0;
+#ifdef CHRONO_HAS_SCM_GPU
+        ComputeRayCastGpuHip(raw_hits, rc_num_ray_casts);
+#endif
+        m_num_ray_casts += rc_num_ray_casts;
+        absorb_raycast_hits(raw_hits);
+    } else if (m_raycast_gpu_ref_enabled && m_user_domains) {
+        // GPU ray-cast reference backend (CPU stand-in; see SCM_RAYCAST_GPU_PLAN.md).
+        std::vector<RaycastHit> raw_hits;
+        int rc_num_ray_casts = 0;
+        ComputeRayCastGpuReference(raw_hits, rc_num_ray_casts);
+        m_num_ray_casts += rc_num_ray_casts;
+        absorb_raycast_hits(raw_hits);
+    } else {
 
 #ifdef RAY_CASTING_WITH_CRITICAL_SECTION
 
@@ -1321,6 +1567,8 @@ void SCMLoader::ComputeInternalForces() {
     }
 
 #endif
+
+    }  // end else (!m_raycast_gpu_ref_enabled || !m_user_domains)
 
     m_timer_ray_casting.stop();
 

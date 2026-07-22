@@ -279,7 +279,10 @@ if(CH_ENABLE_MODULE_FSI_SPH)
 endif()
 source_group("terrain" FILES ${CV_TERRAIN_FILES})
 if(CH_USE_SCM_GPU)
-    set(CV_SCM_GPU_HIP_FILES terrain/gpu/SCMGpuKernels.hip.cpp)
+    set(CV_SCM_GPU_HIP_FILES
+        terrain/gpu/SCMGpuKernels.hip.cpp
+        terrain/gpu/SCMRaycastGpuKernels.hip.cpp
+    )
     set_source_files_properties(${CV_SCM_GPU_HIP_FILES} PROPERTIES LANGUAGE HIP)
     list(APPEND CV_TERRAIN_FILES
         terrain/SCMGpu.h
@@ -287,6 +290,10 @@ if(CH_USE_SCM_GPU)
         terrain/SCMTerrainGpu.h
         terrain/SCMTerrainGpu.cpp
         terrain/gpu/SCMGpuHost.cpp
+        terrain/SCMRaycastGpu.h
+        terrain/SCMRaycastGpuTypes.h
+        terrain/SCMTerrainRaycastGpu.cpp
+        terrain/gpu/SCMRaycastGpuHost.cpp
         ${CV_SCM_GPU_HIP_FILES}
     )
 endif()
