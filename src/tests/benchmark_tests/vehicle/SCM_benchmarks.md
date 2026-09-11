@@ -76,6 +76,10 @@ i7-13700K (16 cores / 24 threads, 30 MiB L3), 62 GB. Release, `-O3 -march=native
 threads 4, container `atk/chrono:orb`. GCC 11.4.0 and AMD clang 22.0 (ships with ROCm 7.2.4).
 CUDA 13.2.78; HIP columns are ROCm 7.2.4 with `CMAKE_HIP_PLATFORM=nvidia`.
 
+**The `CUDA` columns need a backend that is not in the tree.** SCM ships HIP kernels only
+(`SCMRaycastGpuKernels.hip.cpp`); the CUDA path is a separate change. These cells were measured with
+it applied and cannot be reproduced until it lands. Every other column builds from this branch.
+
 GPU cells are the mean of 2 processes, `ref` and CPU of 1, each itself Google Benchmark's mean over
 5 or 10 internal repetitions. Worst internal cv on `SCM_Total` was 3.21% (clang/CPU `MESH_0`); every
 other cell was under 2%.
@@ -175,6 +179,12 @@ work, and a shared 16-core EPYC slice loses to a 5.3 GHz Raptor Lake on a four-t
 
 - **One machine per platform.** L3 size is implicated in every CPU-path figure, and the AMD host is
   a shared slice.
+
+- **The tables were taken at `1753904fd`, before `ChWheelTestRig` was refactored upstream.** A spot
+  check after that refactor left `SCM_Nodes` and `SCM_Rays` identical to the digit on both wheel
+  variants, so the scene is unchanged, and put `SCM_Total` about 3% above these figures on each --
+  inside the 10% spread that repeated `D20` processes show on this host. Treat the wheel rows as
+  good to a few percent rather than to the last digit.
 
 # Reproducing
 
