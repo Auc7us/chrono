@@ -155,6 +155,18 @@ void WarnNoMeshGeometryOnce() {
                  "active-domain bodies. Using the CPU ray-cast path." << std::endl;
 }
 
+void WarnMixedGeometryOnce(std::size_t faceless, std::size_t total) {
+    static bool warned = false;
+    if (warned)
+        return;
+    warned = true;
+    std::cerr << "SCM ray-cast: " << faceless << " of " << total
+              << " active-domain bodies carry no triangle-mesh collision geometry. These kernels "
+                 "intersect triangles only, so those bodies would receive no reaction from the soil "
+                 "and sink through the terrain. Using the CPU ray-cast path for the whole scene."
+              << std::endl;
+}
+
 RaycastBodyTransform BuildTransform(ChBody* body, const LocalBox& box) {
     ChFrame<> f = body->GetFrameRefToAbs();
     ChVector3d p = f.GetPos();
@@ -231,6 +243,26 @@ bool SCMLoader::ComputeRayCastGpuHip(std::vector<RaycastHit>& out_hits, int& num
             // RoboSimian limbs and sled) land here. Report once and let the caller use the CPU path,
             // which tests against the full collision system and handles every shape type.
             WarnNoMeshGeometryOnce();
+            return false;
+        }
+
+        // A candidate that contributed no faces is invisible to these kernels: nothing to intersect,
+        // so no hit, so it never appears as a hit's contactable and receives nothing back from the
+        // soil. It falls through the terrain.
+        //
+        // Testing faces.empty() alone only catches the scene where *every* candidate is face-less.
+        // The mixed scene is the dangerous one, because it keeps the GPU path and silently drops
+        // just the primitives: an HMMWV on cylinder tyres driving among mesh rocks deforms 665 nodes
+        // on this path against 5426 on the CPU loop -- the rocks work the soil and the four tyres do
+        // nothing. Decline the step whenever any candidate is face-less and let the caller fall back
+        // for the whole scene, which is the only choice that gets every body right.
+        std::size_t faceless = 0;
+        for (const auto& m : margins) {
+            if (m.face_end == m.face_begin)
+                faceless++;
+        }
+        if (faceless > 0) {
+            WarnMixedGeometryOnce(faceless, margins.size());
             return false;
         }
 
