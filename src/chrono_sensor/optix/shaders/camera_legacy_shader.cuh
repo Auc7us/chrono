@@ -28,6 +28,77 @@
 #include "chrono_sensor/optix/shaders/ChOptixLightHubs.cuh"
 
 
+/// Retroreflection (BSDFType::RETROREFLECTIVE materials, e.g. traffic sheeting): light is sent back toward
+/// its source. The strength per texel is the Kd texture's alpha (1/255 = none, 1 = full), the colour its rgb.
+/// The coefficient of retroreflection R_A [cd/lx/m^2] follows white microprismatic sheeting (ASTM D4956
+/// Type XI: about 580 at 0.2 deg observation angle, 220 at 0.5 deg, 50 at 1 deg) with a slow tail, times
+/// cos^2 of the entrance angle. Returned in shader units (pi * R_A: the shader's diffuse term is albedo * E,
+/// i.e. pi * luminance / illuminance), to be multiplied by the irradiance on a plane facing the light.
+static __device__ __inline__ float RetroCoefficient(const float& cos_observation, const float& cos_entrance) {
+    float obs_deg = acosf(fminf(fmaxf(cos_observation, -1.f), 1.f)) * 57.29578f;
+    float ra = 1060.f * expf(-obs_deg / 0.33f) + 6.f * expf(-obs_deg / 3.f);
+    float ce = fmaxf(cos_entrance, 0.f);
+    return CUDART_PI_F * ra * ce * ce;
+}
+
+/// Integral of R_A over the observation-angle lobe, 2 pi (1060 a0^2 + 6 a1^2) with a0, a1 in rad: the
+/// fraction of the luminance behind the viewer that retroreflection returns from an extended source (sky).
+#define RETRO_LOBE_INTEGRAL 0.325f
+
+/// Retroreflected colour x strength of a material at uv (zero if it is not retroreflective).
+static __device__ __inline__ float3 RetroColour(const MaterialParameters& mat, const float2& uv) {
+    if (mat.bsdf_type != BSDFType::RETROREFLECTIVE)
+        return make_float3(0.f);
+    float3 c = mat.Kd;
+    float s = 1.f;
+    if (mat.kd_tex) {
+        const float4 tex = tex2D<float4>(mat.kd_tex, uv.x * mat.tex_scale.x, uv.y * mat.tex_scale.y);
+        c = Pow(make_float3(tex.x, tex.y, tex.z), 2.2);
+        s = fmaxf((tex.w - 1.f / 255.f) * (255.f / 254.f), 0.f);
+    }
+    return c * (s / fmaxf(fmaxf(c.x, c.y), fmaxf(c.z, 1e-4f)));
+}
+
+/// Retroreflection of the environment light: what lies behind the viewer, unless something (the viewer's
+/// own vehicle, say) is in the way.
+static __device__ __inline__ float3 CalculateRetroEnvironment(const ContextParameters& params,
+                                                              PerRayData_camera* prd_camera,
+                                                              const int& num_blended_materials,
+                                                              const unsigned int& material_id,
+                                                              const float2& uv,
+                                                              const float3& hit_point,
+                                                              const float3& world_normal,
+                                                              const float3& ray_dir) {
+    float3 retro = make_float3(0.f);
+    for (int b = 0; b < num_blended_materials; b++)
+        retro += RetroColour(params.material_pool[material_id + b], uv) * (1.f / num_blended_materials);
+    const float3 dir = -ray_dir;
+    const float cos_e = Dot(world_normal, dir);
+    if (fmaxf(retro) <= 0.f || cos_e <= 0.f)
+        return make_float3(0.f);
+
+    for (int i = 0; i < params.num_lights; i++) {
+        if (params.lights[i].light_type != LightType::ENVIRONMENT_LIGHT)
+            continue;
+        PerRayData_occlusion prd_occ;
+        prd_occ.occluded = false;
+        unsigned int opt1, opt2;
+        pointer_as_ints(&prd_occ, opt1, opt2);
+        unsigned int raytype = (unsigned int)RayType::OCCLUSION_RAY_TYPE;
+        optixTrace(params.root, hit_point, dir, params.scene_epsilon, 1e16f, optixGetRayTime(),
+                   OptixVisibilityMask(1), OPTIX_RAY_FLAG_TERMINATE_ON_FIRST_HIT, 0, 1, 0, opt1, opt2, raytype);
+        if (prd_occ.occluded)
+            return make_float3(0.f);
+        const EnvironmentLightData& env = params.lights[i].specific.environment;
+        float tx = atan2f(dir.y, dir.x) / (2.f * CUDART_PI_F) + 0.5f;
+        float ty = asinf(fminf(fmaxf(dir.z, -1.f), 1.f)) / CUDART_PI_F + 0.5f;
+        float4 rgba = tex2D<float4>(env.env_map, tx, ty);
+        return retro * make_float3(rgba.x, rgba.y, rgba.z) *
+               (env.intensity_scale * RETRO_LOBE_INTEGRAL * cos_e * cos_e) * prd_camera->contrib_to_pixel;
+    }
+    return make_float3(0.f);
+}
+
 /// Global illumination ray
 static __device__ __inline__ float3 CalculateGIReflectionColor(const ContextParameters& params,
                                                                PerRayData_camera* prd_camera,
@@ -399,6 +470,14 @@ static __device__ __inline__ float3 CalculateReflectedColor(const ContextParamet
                             float G = HammonSmith(NdV, NdL, roughness);  // 4  * NdV * NdL omitted
                             float3 f_ct = F * D * G;
                             light_reflected_color += f_ct * incoming_light_ray * contrib_weight;
+
+                            // Retroreflection of this light (sampled environment directions are not
+                            // aimed at the viewer: see CalculateRetroEnvironment). ls.L includes NdL.
+                            const float3 retro = RetroColour(mat, uv);
+                            if (fmaxf(retro) > 0.f && l.light_type != LightType::ENVIRONMENT_LIGHT) {
+                                light_reflected_color += retro * RetroCoefficient(Dot(ls.dir, -ray_dir), NdL) *
+                                                         (ls.L * light_attenuation / NdL) * contrib_weight;
+                            }
                         }
                     }
                 }
@@ -540,6 +619,10 @@ static __device__ __inline__ void CameraLegacyShader(const ContextParameters& pa
     // for each light, traverse to light, and calculate each material's shading
     float3 light_reflected_color =
         CalculateReflectedColor(params, prd_camera, num_blended_materials, material_id, uv, hit_point, world_normal, ray_dir);
+
+    // retroreflected environment (sky behind the viewer)
+    light_reflected_color +=
+        CalculateRetroEnvironment(params, prd_camera, num_blended_materials, material_id, uv, hit_point, world_normal, ray_dir);
 
     // for each blended material, calculating total ambient light
     float3 ambient_light =
